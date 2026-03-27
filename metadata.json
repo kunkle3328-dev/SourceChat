@@ -1,5 +1,5 @@
 {
   "name": "SourceChat",
   "description": "A local LLM chatbot that lets users chat with their sources, like NotebookLM.",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["microphone", "autoplay"]
 }

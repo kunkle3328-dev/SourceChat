@@ -1,15 +1,17 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
-import { Source, Message, Notebook } from './types';
+import { Source, Message, Notebook, VoiceModeState } from './types';
 import { chatWithSourcesStream, summarizeSource } from './lib/gemini';
 import { cn } from './lib/utils';
 import { 
   Menu, X, Upload, FileText, Trash2, Send, 
-  Bot, User, Paperclip, Loader2, File, FileImage, FileAudio, FileVideo, Link as LinkIcon, Plus, Info, ExternalLink, Sparkles, Book, CheckCircle2, Circle
+  Bot, User, Paperclip, Loader2, File, FileImage, FileAudio, FileVideo, Link as LinkIcon, Plus, Info, ExternalLink, Sparkles, Book, CheckCircle2, Circle, Mic, MessageSquare
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { motion, AnimatePresence } from 'motion/react';
+import { VoiceModal } from './components/VoiceModal';
+import { AdvancedLoadingState } from './components/AdvancedLoadingState';
 
 const SourceModal = ({ source, onClose }: { source: Source; onClose: () => void }) => {
   const [activeTab, setActiveTab] = useState<'summary' | 'preview'>('summary');
@@ -89,9 +91,8 @@ const SourceModal = ({ source, onClose }: { source: Source; onClose: () => void 
               </div>
               <div className="glass-panel rounded-2xl sm:rounded-3xl p-3 sm:p-8 prose prose-invert prose-p:leading-relaxed prose-headings:text-[var(--glass-text)] prose-strong:text-[var(--glass-accent)] max-w-none text-sm sm:text-base text-[var(--glass-text)]">
                 {source.isSummarizing ? (
-                  <div className="flex flex-col items-center justify-center py-8 sm:py-12 space-y-4">
-                    <Loader2 className="w-10 h-10 animate-spin text-[var(--glass-accent)]" />
-                    <span className="text-sm font-bold text-[var(--glass-text-muted)] uppercase tracking-widest animate-pulse">Analyzing Source...</span>
+                  <div className="flex flex-col items-center justify-center py-8 sm:py-12">
+                    <AdvancedLoadingState />
                   </div>
                 ) : source.summary ? (
                   <Markdown remarkPlugins={[remarkGfm]}>{source.summary}</Markdown>
@@ -161,21 +162,35 @@ const SourceModal = ({ source, onClose }: { source: Source; onClose: () => void 
 };
 
 export default function App() {
-  const [notebooks, setNotebooks] = useState<Notebook[]>([
-    { id: 'default', name: 'General Research', createdAt: Date.now() }
-  ]);
-  const [activeNotebookId, setActiveNotebookId] = useState<string>('default');
+  const [notebooks, setNotebooks] = useState<Notebook[]>(() => {
+    const saved = localStorage.getItem('sourcechat_notebooks');
+    return saved ? JSON.parse(saved) : [
+      { id: 'default', name: 'General Research', createdAt: Date.now() }
+    ];
+  });
+  const [activeNotebookId, setActiveNotebookId] = useState<string>(() => {
+    return localStorage.getItem('sourcechat_active_notebook_id') || 'default';
+  });
   const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
   const [newNotebookName, setNewNotebookName] = useState('');
 
-  const [sources, setSources] = useState<Source[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [sources, setSources] = useState<Source[]>(() => {
+    const saved = localStorage.getItem('sourcechat_sources');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const saved = localStorage.getItem('sourcechat_messages');
+    return saved ? JSON.parse(saved) : [];
+  });
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isAddingLink, setIsAddingLink] = useState(false);
   const [linkUrl, setLinkUrl] = useState('');
   const [selectedSource, setSelectedSource] = useState<Source | null>(null);
+  const [isVoiceModalOpen, setIsVoiceModalOpen] = useState(false);
+  const [voiceSelectedMessage, setVoiceSelectedMessage] = useState<Message | null>(null);
+  const [micPermission, setMicPermission] = useState<'granted' | 'denied' | 'prompt'>('prompt');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -185,15 +200,67 @@ export default function App() {
   const activeMessages = messages.filter(m => (m.notebookId || 'default') === activeNotebookId);
 
   useEffect(() => {
+    localStorage.setItem('sourcechat_notebooks', JSON.stringify(notebooks));
+  }, [notebooks]);
+
+  useEffect(() => {
+    localStorage.setItem('sourcechat_active_notebook_id', activeNotebookId);
+  }, [activeNotebookId]);
+
+  useEffect(() => {
+    localStorage.setItem('sourcechat_sources', JSON.stringify(sources));
+  }, [sources]);
+
+  useEffect(() => {
+    localStorage.setItem('sourcechat_messages', JSON.stringify(messages));
+  }, [messages]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [activeMessages]);
 
+  useEffect(() => {
+    const checkMicPermission = async () => {
+      try {
+        const result = await navigator.permissions.query({ name: 'microphone' as any });
+        setMicPermission(result.state);
+        result.onchange = () => setMicPermission(result.state);
+      } catch (e) {
+        console.warn("Permissions API not supported for microphone check");
+      }
+    };
+    checkMicPermission();
+  }, []);
+
+  const requestMicPermission = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach(track => track.stop());
+      setMicPermission('granted');
+    } catch (e) {
+      setMicPermission('denied');
+      console.error("Mic permission denied:", e);
+    }
+  };
+
   const triggerSummarization = useCallback(async (source: Source) => {
+    const timeoutId = setTimeout(() => {
+      setSources(prev => prev.map(s => {
+        if (s.id === source.id && s.isSummarizing) {
+          console.warn("Summarization safety timeout triggered for:", s.name);
+          return { ...s, isSummarizing: false, summary: "Summarization is taking longer than expected. You can still use this source in chat." };
+        }
+        return s;
+      }));
+    }, 130000);
+
     try {
       setSources(prev => prev.map(s => s.id === source.id ? { ...s, isSummarizing: true } : s));
       const summary = await summarizeSource(source);
+      clearTimeout(timeoutId);
       setSources(prev => prev.map(s => s.id === source.id ? { ...s, summary, isSummarizing: false } : s));
     } catch (error) {
+      clearTimeout(timeoutId);
       console.error("Summarization Error:", error);
       setSources(prev => prev.map(s => s.id === source.id ? { ...s, isSummarizing: false, summary: "Failed to generate summary. Please try again." } : s));
     }
@@ -347,6 +414,21 @@ export default function App() {
       }
     ]);
 
+    const safetyTimeoutId = setTimeout(() => {
+      setIsLoading(prev => {
+        if (prev) {
+          setMessages(msgs => msgs.map(msg => {
+            if (msg.id === modelMessageId && !msg.text) {
+              return { ...msg, text: "**System Error:** The request is taking too long. This can happen with very large documents or complex web pages. Please try a shorter query or check your connection." };
+            }
+            return msg;
+          }));
+          return false;
+        }
+        return prev;
+      });
+    }, 130000);
+
     try {
       await chatWithSourcesStream(
         [...activeMessages, userMessage],
@@ -360,7 +442,9 @@ export default function App() {
           }));
         }
       );
+      clearTimeout(safetyTimeoutId);
     } catch (error) {
+      clearTimeout(safetyTimeoutId);
       console.error("Chat error:", error);
       setMessages(prev => prev.map(msg => {
         if (msg.id === modelMessageId) {
@@ -373,6 +457,39 @@ export default function App() {
     }
   };
 
+  const handleVoiceFollowUp = (msg: Message) => {
+    setVoiceSelectedMessage(msg);
+    setIsVoiceModalOpen(true);
+  };
+
+  const handleVoiceModalClose = (summary?: string, transcript?: string[]) => {
+    setIsVoiceModalOpen(false);
+    if (summary) {
+      const summaryMessage: Message = {
+        id: uuidv4(),
+        notebookId: activeNotebookId,
+        role: 'model',
+        text: `### 🎙️ Voice Conversation Summary\n\n${summary}\n\n*You can continue the conversation here in text or start another live session.*`,
+        createdAt: Date.now(),
+        isVoiceSummary: true,
+        voiceTranscript: transcript
+      };
+      setMessages(prev => [...prev, summaryMessage]);
+    }
+    setVoiceSelectedMessage(null);
+  };
+
+  const handleStartNewChat = () => {
+    const newNb = { 
+      id: uuidv4(), 
+      name: `New Chat ${notebooks.length + 1}`, 
+      createdAt: Date.now() 
+    };
+    setNotebooks(prev => [...prev, newNb]);
+    setActiveNotebookId(newNb.id);
+    setIsSidebarOpen(false);
+  };
+
   return (
     <div className="flex h-screen bg-transparent text-[var(--glass-text)] font-sans overflow-hidden selection:bg-[var(--glass-accent)]/30">
       <AnimatePresence>
@@ -380,6 +497,19 @@ export default function App() {
           <SourceModal 
             source={selectedSource} 
             onClose={() => setSelectedSource(null)} 
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {isVoiceModalOpen && voiceSelectedMessage && (
+          <VoiceModal
+            isOpen={isVoiceModalOpen}
+            onClose={handleVoiceModalClose}
+            onStartNewChat={handleStartNewChat}
+            selectedMessage={voiceSelectedMessage}
+            chatHistory={activeMessages}
+            sources={activeSources}
           />
         )}
       </AnimatePresence>
@@ -401,10 +531,10 @@ export default function App() {
       <div className={cn(
         "fixed z-50 flex flex-col transition-transform duration-300 ease-in-out glass-panel-heavy",
         // Mobile (Bottom Sheet)
-        "inset-x-0 bottom-0 w-full h-[85vh] rounded-t-[2rem] shadow-[0_-10px_40px_rgba(0,0,0,0.5)] lg:shadow-none",
+        "inset-x-0 top-[10dvh] bottom-0 w-full pb-[env(safe-area-inset-bottom,20px)] rounded-t-[2rem] shadow-[0_-10px_40px_rgba(0,0,0,0.5)] lg:shadow-none",
         isSidebarOpen ? "translate-y-0" : "translate-y-full",
         // Desktop (Sidebar)
-        "lg:inset-y-0 lg:left-0 lg:w-80 lg:h-full lg:rounded-none lg:translate-y-0 lg:translate-x-0 lg:border-r lg:border-[var(--glass-border)]"
+        "lg:top-0 lg:inset-y-0 lg:left-0 lg:w-80 lg:h-full lg:rounded-none lg:translate-y-0 lg:translate-x-0 lg:border-r lg:border-[var(--glass-border)]"
       )}>
         {/* Drag Handle for Mobile */}
         <div className="w-full flex justify-center pt-4 pb-2 lg:hidden" onClick={() => setIsSidebarOpen(false)}>
@@ -427,6 +557,68 @@ export default function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-3 sm:p-5 lg:p-4 flex flex-col gap-4 sm:gap-6">
+          {/* Add Source Section (Moved to top for mobile visibility) */}
+          <div className="space-y-3 sm:space-y-4 flex flex-col min-h-0 px-1">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-bold text-[var(--glass-text-muted)] uppercase tracking-[0.2em] truncate pr-2">
+                Sources in {activeNotebook.name}
+              </h2>
+              <span className="text-[10px] font-bold glass-panel-heavy text-[var(--glass-text-muted)] px-2 py-1 rounded-lg shrink-0">
+                {activeSources.length}
+              </span>
+            </div>
+
+            <div className="flex gap-2 sm:gap-3">
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="flex-1 flex items-center justify-center gap-2 glass-button py-2.5 sm:py-3 px-3 rounded-2xl text-sm font-semibold text-[var(--glass-text-muted)] hover:text-[var(--glass-text)]"
+              >
+                <Upload className="w-4 h-4" />
+                File
+              </button>
+              <button
+                onClick={() => setIsAddingLink(!isAddingLink)}
+                className={cn(
+                  "flex-1 flex items-center justify-center gap-2 py-2.5 sm:py-3 px-3 rounded-2xl text-sm font-semibold transition-all",
+                  isAddingLink 
+                    ? "glass-panel-heavy text-[var(--glass-accent)]" 
+                    : "glass-button text-[var(--glass-text-muted)] hover:text-[var(--glass-text)]"
+                )}
+              >
+                <LinkIcon className="w-4 h-4" />
+                Link
+              </button>
+            </div>
+
+            <AnimatePresence>
+              {isAddingLink && (
+                <motion.form 
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  onSubmit={handleAddLink} 
+                  className="flex gap-3 overflow-hidden pt-2"
+                >
+                  <input
+                    type="url"
+                    value={linkUrl}
+                    onChange={e => setLinkUrl(e.target.value)}
+                    placeholder="Paste website URL..."
+                    className="flex-1 glass-input rounded-xl px-3 py-2 sm:px-4 sm:py-3 text-sm bg-black/50 border border-white/10"
+                    autoFocus
+                  />
+                  <button 
+                    type="submit" 
+                    disabled={!linkUrl.trim()}
+                    className="w-10 h-10 sm:w-12 sm:h-12 shrink-0 glass-icon-btn text-[var(--glass-accent)] disabled:opacity-50 disabled:text-[var(--glass-text-muted)] bg-black/50 border border-white/10"
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+                </motion.form>
+              )}
+            </AnimatePresence>
+          </div>
+
           {/* Notebooks Section */}
           <div className="space-y-3 sm:space-y-4">
             <div className="flex items-center justify-between px-1">
@@ -491,67 +683,6 @@ export default function App() {
             </div>
           </div>
 
-          <div className="space-y-3 sm:space-y-4 flex-1 flex flex-col min-h-0 px-1">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-bold text-[var(--glass-text-muted)] uppercase tracking-[0.2em] truncate pr-2">
-                Sources in {activeNotebook.name}
-              </h2>
-              <span className="text-[10px] font-bold glass-panel-heavy text-[var(--glass-text-muted)] px-2 py-1 rounded-lg shrink-0">
-                {activeSources.length}
-              </span>
-            </div>
-
-            <div className="flex gap-2 sm:gap-3">
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="flex-1 flex items-center justify-center gap-2 glass-button py-2.5 sm:py-3 px-3 rounded-2xl text-sm font-semibold text-[var(--glass-text-muted)] hover:text-[var(--glass-text)]"
-              >
-                <Upload className="w-4 h-4" />
-                File
-              </button>
-              <button
-                onClick={() => setIsAddingLink(!isAddingLink)}
-                className={cn(
-                  "flex-1 flex items-center justify-center gap-2 py-2.5 sm:py-3 px-3 rounded-2xl text-sm font-semibold transition-all",
-                  isAddingLink 
-                    ? "glass-panel-heavy text-[var(--glass-accent)]" 
-                    : "glass-button text-[var(--glass-text-muted)] hover:text-[var(--glass-text)]"
-                )}
-              >
-                <LinkIcon className="w-4 h-4" />
-                Link
-              </button>
-            </div>
-
-            <AnimatePresence>
-              {isAddingLink && (
-                <motion.form 
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  onSubmit={handleAddLink} 
-                  className="flex gap-3 overflow-hidden pt-2"
-                >
-                  <input
-                    type="url"
-                    value={linkUrl}
-                    onChange={e => setLinkUrl(e.target.value)}
-                    placeholder="Paste website URL..."
-                    className="flex-1 glass-input rounded-xl px-3 py-2 sm:px-4 sm:py-3 text-sm"
-                    autoFocus
-                  />
-                  <button 
-                    type="submit" 
-                    disabled={!linkUrl.trim()}
-                    className="w-10 h-10 sm:w-12 sm:h-12 shrink-0 glass-icon-btn text-[var(--glass-accent)] disabled:opacity-50 disabled:text-[var(--glass-text-muted)]"
-                  >
-                    <Plus className="w-5 h-5" />
-                  </button>
-                </motion.form>
-              )}
-            </AnimatePresence>
-          </div>
-
           <input
             type="file"
             ref={fileInputRef}
@@ -561,7 +692,9 @@ export default function App() {
             accept=".pdf,.txt,.md,.csv,.json,.png,.jpg,.jpeg,.webp"
           />
 
-          <div className="space-y-4 overflow-y-auto flex-1 px-1 pb-4">
+          <div className="space-y-3 sm:space-y-4 flex-1 flex flex-col min-h-0 px-1">
+            {/* Sources List Section */}
+            <div className="space-y-4 overflow-y-auto flex-1 px-1 pb-4">
             {activeSources.length === 0 ? (
               <div className="text-center py-6 sm:py-12 px-3 sm:px-4 text-[var(--glass-text-muted)] text-sm glass-panel-heavy rounded-2xl sm:rounded-3xl">
                 <div className="w-10 h-10 sm:w-12 sm:h-12 glass-panel rounded-xl sm:rounded-2xl flex items-center justify-center mx-auto mb-3 sm:mb-4">
@@ -658,8 +791,9 @@ export default function App() {
             )}
           </div>
         </div>
+      </div>
         
-        <div className="p-6 text-[10px] font-bold text-[var(--glass-text-muted)] text-center uppercase tracking-[0.2em]">
+      <div className="p-6 text-[10px] font-bold text-[var(--glass-text-muted)] text-center uppercase tracking-[0.2em]">
           Neural Engine Active
         </div>
       </div>
@@ -684,14 +818,28 @@ export default function App() {
                 <p className="text-[9px] sm:text-[10px] font-bold text-[var(--glass-text-muted)] uppercase tracking-widest truncate">Research Workspace</p>
               </div>
             </div>
-            {activeSources.filter(s => s.status === 'ready' && s.isActive !== false).length > 0 && (
-              <div className="hidden sm:flex items-center gap-2 glass-panel-heavy px-4 py-2 rounded-2xl shrink-0 ml-2">
-                <div className="w-2 h-2 bg-[var(--glass-accent)] rounded-full shadow-[0_0_8px_var(--glass-accent)] animate-pulse" />
-                <span className="text-xs font-bold text-[var(--glass-accent)] uppercase tracking-wider">
-                  {activeSources.filter(s => s.status === 'ready' && s.isActive !== false).length} Active Contexts
-                </span>
-              </div>
-            )}
+            <div className="flex items-center gap-2 sm:gap-4 shrink-0 ml-2">
+              {micPermission !== 'granted' && (
+                <button
+                  onClick={requestMicPermission}
+                  className={cn(
+                    "flex items-center gap-2 px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all",
+                    micPermission === 'denied' ? "bg-red-500/20 text-red-400 border border-red-500/30" : "glass-panel text-[var(--glass-accent)] hover:bg-[var(--glass-accent)]/10"
+                  )}
+                >
+                  <Mic className="w-3 h-3" />
+                  {micPermission === 'denied' ? "Mic Blocked" : "Enable Mic"}
+                </button>
+              )}
+              {activeSources.filter(s => s.status === 'ready' && s.isActive !== false).length > 0 && (
+                <div className="hidden sm:flex items-center gap-2 glass-panel-heavy px-4 py-2 rounded-2xl shrink-0">
+                  <div className="w-2 h-2 bg-[var(--glass-accent)] rounded-full shadow-[0_0_8px_var(--glass-accent)] animate-pulse" />
+                  <span className="text-xs font-bold text-[var(--glass-accent)] uppercase tracking-wider">
+                    {activeSources.filter(s => s.status === 'ready' && s.isActive !== false).length} Active Contexts
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
         </header>
 
@@ -759,21 +907,72 @@ export default function App() {
                         ? "glass-panel text-[var(--glass-text)] rounded-tr-md" 
                         : "glass-panel-heavy text-[var(--glass-text)] prose prose-invert prose-p:leading-relaxed prose-pre:bg-transparent prose-pre:shadow-none prose-pre:border prose-pre:border-[var(--glass-border)] prose-a:text-[var(--glass-accent)] prose-a:no-underline hover:prose-a:underline prose-headings:text-[var(--glass-text)] prose-headings:font-bold prose-strong:text-[var(--glass-accent)] w-full max-w-none"
                     )}>
-                      {msg.role === 'user' ? (
+                      {msg.isVoiceSummary ? (
+                        <div className="space-y-4">
+                          <div className="flex items-center gap-2 text-[var(--glass-accent)] mb-2">
+                            <Mic className="w-4 h-4" />
+                            <span className="text-xs font-bold uppercase tracking-widest">Voice Session Summary</span>
+                          </div>
+                          <div className="markdown-body">
+                            <Markdown remarkPlugins={[remarkGfm]}>{msg.text}</Markdown>
+                          </div>
+                          {msg.voiceTranscript && msg.voiceTranscript.length > 0 && (
+                            <details className="mt-4 group/transcript">
+                              <summary className="text-[10px] font-bold uppercase tracking-widest text-[var(--glass-text-muted)] cursor-pointer hover:text-[var(--glass-accent)] transition-colors list-none flex items-center gap-2">
+                                <span className="group-open/transcript:rotate-90 transition-transform">▶</span>
+                                View Full Transcript ({msg.voiceTranscript.length} turns)
+                              </summary>
+                              <div className="mt-4 space-y-4 pl-4 border-l-2 border-[var(--glass-border)] max-h-96 overflow-y-auto custom-scrollbar">
+                                {msg.voiceTranscript.map((line, i) => {
+                                  const isUser = line.startsWith('User:');
+                                  const content = line.replace(/^(User|AI):\s*/, '');
+                                  return (
+                                    <div key={i} className="space-y-1">
+                                      <span className={cn(
+                                        "text-[10px] font-bold uppercase tracking-widest",
+                                        isUser ? "text-[var(--glass-accent)]" : "text-[var(--glass-text-muted)]"
+                                      )}>
+                                        {isUser ? 'You' : 'AI'}
+                                      </span>
+                                      <p className="text-sm leading-relaxed text-[var(--glass-text)] opacity-90">
+                                        {content}
+                                      </p>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      ) : msg.role === 'user' ? (
                         <div className="whitespace-pre-wrap">{msg.text}</div>
                       ) : (
                         <div className="markdown-body">
-                          <Markdown remarkPlugins={[remarkGfm]}>
-                            {msg.text || (isLoading && msg.id === activeMessages[activeMessages.length - 1].id ? '...' : '')}
-                          </Markdown>
+                          {isLoading && msg.id === activeMessages[activeMessages.length - 1].id && !msg.text ? (
+                            <AdvancedLoadingState />
+                          ) : (
+                            <Markdown remarkPlugins={[remarkGfm]}>
+                              {msg.text}
+                            </Markdown>
+                          )}
                           {msg.role === 'model' && msg.text && (
-                            <button 
-                              onClick={() => navigator.clipboard.writeText(msg.text)}
-                              className="absolute top-2 right-2 sm:top-4 sm:right-4 w-8 h-8 glass-icon-btn text-[var(--glass-text-muted)] hover:text-[var(--glass-text)] opacity-0 group-hover/msg:opacity-100 transition-all"
-                              title="Copy response"
-                            >
-                              <Paperclip className="w-4 h-4 rotate-45" />
-                            </button>
+                            <div className="absolute top-2 right-2 sm:top-4 sm:right-4 flex items-center gap-2 opacity-0 group-hover/msg:opacity-100 transition-all">
+                              <button 
+                                onClick={() => handleVoiceFollowUp(msg)}
+                                className="flex items-center gap-2 px-3 py-1.5 glass-panel-heavy rounded-xl text-[10px] font-bold uppercase tracking-widest text-[var(--glass-accent)] hover:scale-105 transition-all"
+                                title="Talk about this live"
+                              >
+                                <Mic className="w-3 h-3" />
+                                Talk Live
+                              </button>
+                              <button 
+                                onClick={() => navigator.clipboard.writeText(msg.text)}
+                                className="w-8 h-8 glass-icon-btn text-[var(--glass-text-muted)] hover:text-[var(--glass-text)]"
+                                title="Copy response"
+                              >
+                                <Paperclip className="w-4 h-4 rotate-45" />
+                              </button>
+                            </div>
                           )}
                         </div>
                       )}
