@@ -469,7 +469,7 @@ export default function App() {
         id: uuidv4(),
         notebookId: activeNotebookId,
         role: 'model',
-        text: `### 🎙️ Voice Conversation Summary\n\n${summary}\n\n*You can continue the conversation here in text or start another live session.*`,
+        text: `${summary}\n\n*You can continue the conversation here in text or start another live session.*`,
         createdAt: Date.now(),
         isVoiceSummary: true,
         voiceTranscript: transcript

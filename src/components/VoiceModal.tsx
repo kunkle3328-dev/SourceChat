@@ -36,11 +36,13 @@ export const VoiceModal: React.FC<VoiceModalProps> = ({
   const [hasStarted, setHasStarted] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [showCaptions, setShowCaptions] = useState(true);
+  const [isTranscriptVisible, setIsTranscriptVisible] = useState(true);
   const [selectedVoice, setSelectedVoice] = useState('Puck');
   const [showPrivacy, setShowPrivacy] = useState(false);
   
   const [isMinimized, setIsMinimized] = useState(false);
   
+  const [showFullTranscript, setShowFullTranscript] = useState(false);
   const [webSearchAllowed, setWebSearchAllowed] = useState(true);
   const [useSourcesOnly, setUseSourcesOnly] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -96,6 +98,11 @@ export const VoiceModal: React.FC<VoiceModalProps> = ({
       const systemInstruction = `You are a helpful, conversational AI assistant. You are currently in a live voice session with the user.
 Keep your responses concise, natural, and conversational. Do not read out long URLs or complex markdown formatting.
 The user is asking about this specific message: "${stripUrls(selectedMessage?.text || '')}".
+
+${useSourcesOnly ? 'STRICT RULE: Only use the provided notebook sources to answer. If the answer is not in the sources, say you don\'t know.' : ''}
+${webSearchAllowed && !useSourcesOnly ? 'You have access to real-time web search. Use it to provide up-to-date information if the sources are insufficient.' : ''}
+${!webSearchAllowed && !useSourcesOnly ? 'Use your internal knowledge and the provided sources to answer.' : ''}
+
 Start by briefly acknowledging the message and asking if they have any follow-up questions.`;
 
       const sessionPromise = ai.live.connect({
@@ -125,23 +132,46 @@ Start by briefly acknowledging the message and asking if they have any follow-up
             }
           },
           onmessage: (message: LiveServerMessage) => {
-            // Handle audio output
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && playerRef.current) {
-              setState(VoiceModeState.SPEAKING);
-              playerRef.current.playChunk(base64Audio);
+            const serverContent = message.serverContent;
+            if (!serverContent) return;
+
+            // Handle AI Turn (Audio & Text)
+            if (serverContent.modelTurn) {
+              serverContent.modelTurn.parts.forEach(part => {
+                if (part.inlineData?.data && playerRef.current) {
+                  setState(VoiceModeState.SPEAKING);
+                  playerRef.current.playChunk(part.inlineData.data);
+                }
+                if (part.text) {
+                  setSessionTranscript(prev => {
+                    const lastLine = prev[prev.length - 1];
+                    const newLine = `AI: ${part.text}`;
+                    if (lastLine === newLine) return prev;
+                    return [...prev, newLine];
+                  });
+                  setState(VoiceModeState.LISTENING);
+                }
+              });
+            }
+
+            // Handle User Turn (Transcription)
+            const anyServerContent = serverContent as any;
+            if (anyServerContent.userContent) {
+              anyServerContent.userContent.parts.forEach((part: any) => {
+                if (part.text) {
+                  setSessionTranscript(prev => {
+                    const lastLine = prev[prev.length - 1];
+                    const newLine = `User: ${part.text}`;
+                    if (lastLine === newLine) return prev;
+                    return [...prev, newLine];
+                  });
+                }
+              });
             }
 
             // Handle interruption
-            if (message.serverContent?.interrupted && playerRef.current) {
+            if (serverContent.interrupted && playerRef.current) {
               playerRef.current.stop();
-              setState(VoiceModeState.LISTENING);
-            }
-
-            // Handle transcription
-            const modelText = message.serverContent?.modelTurn?.parts[0]?.text;
-            if (modelText) {
-              setSessionTranscript(prev => [...prev, `AI: ${modelText}`]);
               setState(VoiceModeState.LISTENING);
             }
           },
@@ -182,9 +212,32 @@ Start by briefly acknowledging the message and asking if they have any follow-up
     stopAll();
     setState(VoiceModeState.ENDING);
     
-    const summary = sessionTranscript.length > 0 
-      ? `**Topic Discussed:**\n> ${selectedMessage?.text?.substring(0, 150) || ''}...\n\n**Session Details:**\n- Live voice session completed.`
-      : undefined;
+    // Generate a much more detailed synthesis
+    const aiTurns = sessionTranscript.filter(l => l.startsWith('AI: ')).map(l => l.replace('AI: ', ''));
+    const userTurns = sessionTranscript.filter(l => l.startsWith('User: ')).map(l => l.replace('User: ', ''));
+    
+    let summary = undefined;
+    
+    if (sessionTranscript.length > 0) {
+      summary = `### 🎙️ Detailed Session Synthesis & Insights
+
+**🎯 Core Discussion Point:**
+> ${selectedMessage?.text?.substring(0, 300) || 'General follow-up discussion'}...
+
+**💡 Key Takeaways & AI Insights:**
+${aiTurns.length > 0 
+  ? aiTurns.slice(-5).map(t => `- ${t.length > 150 ? t.substring(0, 150) + '...' : t}`).join('\n')
+  : '- Discussion focused on clarifying source material and exploring related concepts.'}
+
+**📊 Session Metadata:**
+- **Intelligence Mode:** ${useSourcesOnly ? '🔒 Source-Grounded (Strict)' : webSearchAllowed ? '🌐 Hybrid (Web + Sources)' : '🧠 Contextual (Thread Only)'}
+- **Interaction Depth:** ${sessionTranscript.length} total turns (${userTurns.length} user / ${aiTurns.length} AI)
+- **Voice Profile:** ${selectedVoice}
+- **Timestamp:** ${new Date().toLocaleString()}
+
+---
+*This synthesis captures the essence of our live discussion. You can continue exploring these points in the chat below.*`;
+    }
 
     if (action === 'new') {
       onStartNewChat();
@@ -377,7 +430,7 @@ Start by briefly acknowledging the message and asking if they have any follow-up
                   </div>
 
                   {/* Status Text & Captions */}
-                  <div className="text-center space-y-6 w-full max-w-lg">
+                  <div className="text-center space-y-6 w-full max-w-lg px-2">
                     <div className="space-y-2">
                       <h4 className="text-xl sm:text-3xl font-black text-[var(--glass-text)] tracking-tighter uppercase italic">
                         {state === VoiceModeState.CONNECTING ? "Syncing..." :
@@ -393,25 +446,57 @@ Start by briefly acknowledging the message and asking if they have any follow-up
                       </p>
                     </div>
 
-                    {showCaptions && (
-                      <motion.div 
-                        initial={{ opacity: 0, scale: 0.95 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        className="glass-panel-heavy p-5 rounded-[2rem] min-h-[120px] max-h-[180px] overflow-y-auto flex flex-col gap-3 text-left border border-white/5 shadow-inner"
-                      >
-                        {sessionTranscript.map((line, i) => (
-                          <div key={i} className="flex gap-3">
-                            <span className={cn("text-[9px] font-black uppercase tracking-widest shrink-0 mt-1", line.startsWith('User:') ? 'text-[var(--glass-accent)]' : 'text-emerald-400')}>
-                              {line.startsWith('User:') ? 'You' : 'AI'}
-                            </span>
-                            <p className="text-xs font-medium leading-relaxed text-[var(--glass-text)] opacity-90">
-                              {line.replace(/^(User|AI): /, '')}
-                            </p>
-                          </div>
-                        ))}
-                        <div ref={captionsEndRef} />
-                      </motion.div>
-                    )}
+                    <div className="relative w-full">
+                      <div className="flex items-center justify-between mb-2 px-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] font-black text-[var(--glass-text-muted)] uppercase tracking-widest">Live Transcript</span>
+                          <button 
+                            onClick={() => setIsTranscriptVisible(!isTranscriptVisible)}
+                            className="text-[8px] font-bold text-[var(--glass-text-muted)] hover:text-[var(--glass-accent)] uppercase tracking-wider transition-colors"
+                          >
+                            {isTranscriptVisible ? "[ Hide ]" : "[ Show ]"}
+                          </button>
+                        </div>
+                        {isTranscriptVisible && (
+                          <button 
+                            onClick={() => setShowFullTranscript(!showFullTranscript)}
+                            className="text-[9px] font-black text-[var(--glass-accent)] uppercase tracking-widest hover:underline"
+                          >
+                            {showFullTranscript ? "Collapse" : "View Full"}
+                          </button>
+                        )}
+                      </div>
+                      
+                      <AnimatePresence>
+                        {isTranscriptVisible && (
+                          <motion.div 
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ 
+                              opacity: 1, 
+                              height: showFullTranscript ? '240px' : '120px' 
+                            }}
+                            exit={{ opacity: 0, height: 0 }}
+                            className="glass-panel-heavy p-5 rounded-[2rem] overflow-y-auto flex flex-col gap-3 text-left border border-white/5 shadow-inner custom-scrollbar"
+                          >
+                            {sessionTranscript.length === 0 ? (
+                              <p className="text-[10px] text-[var(--glass-text-muted)] italic text-center py-8">No interactions yet...</p>
+                            ) : (
+                              sessionTranscript.map((line, i) => (
+                                <div key={i} className="flex gap-3">
+                                  <span className={cn("text-[9px] font-black uppercase tracking-widest shrink-0 mt-1", line.startsWith('User:') ? 'text-[var(--glass-accent)]' : 'text-emerald-400')}>
+                                    {line.startsWith('User:') ? 'You' : 'AI'}
+                                  </span>
+                                  <p className="text-xs font-medium leading-relaxed text-[var(--glass-text)] opacity-90">
+                                    {line.replace(/^(User|AI): /, '')}
+                                  </p>
+                                </div>
+                              ))
+                            )}
+                            <div ref={captionsEndRef} />
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </div>
                   </div>
                 </>
               )}
